@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+python-multipart
+torch
+torchvision
+tensorflow
+xgboost
+scikit-learn
+pandas
+numpy
+scipy
+opencv-python
+nibabel
+nilearn
+joblib
