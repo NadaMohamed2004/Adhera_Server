@@ -13,3 +13,6 @@ opencv-python
 nibabel
 nilearn
 joblib
+six
+packaging
+python-dateutil

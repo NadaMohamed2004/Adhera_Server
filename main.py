@@ -1,17 +1,21 @@
-import os
+﻿import os
 import io
 import gzip
+import json
+import tempfile
 import torch
 import torch.nn as nn
 import pickle
 import joblib
 import numpy as np
+import pandas as pd
 import nibabel as nib
 import tensorflow as tf
 from scipy.signal import butter, filtfilt
 from fastapi import FastAPI, UploadFile, File
 from pydantic import BaseModel
-from typing import List
+from pathlib import Path
+from typing import Dict, List, Union
 
 from nilearn.masking import compute_brain_mask
 from nilearn.image import math_img, resample_img, smooth_img
@@ -23,6 +27,7 @@ from utils.facial import extract_features_from_video
 
 app = FastAPI(title="Adhera Server V1.0")
 device = get_device()
+BASE_DIR = Path(__file__).resolve().parent
 
 # ===================== Model Architectures =====================
 
@@ -126,53 +131,79 @@ except Exception as e:
 # 4. Facial Model (best_combined_model_lstm_binary)
 print("\n=== Loading Facial Model ===")
 facial_model = None
+facial_threshold = 0.5
 try:
-    # Initialize component models
-    hidden_size = 1024
-    feature_dim = 1280
-    num_layers = 1
-    dropout_rate = 0.5
-    num_classes = 4
-    combined_feature_size = hidden_size * 2
-
-    model_full = LSTMClassifier(feature_dim, hidden_size, num_layers, dropout_rate).to(device)
-    model_face = LSTMClassifier(feature_dim, hidden_size, num_layers, dropout_rate).to(device)
-    mlp_classifier = nn.Sequential(
-        nn.Linear(combined_feature_size, 512),
-        nn.ReLU(),
-        nn.Dropout(0.3),
-        nn.Linear(512, num_classes)
-    ).to(device)
-
-    facial_model = CombinedFacialModel(model_full, model_face, mlp_classifier).to(device)
-
-    # Load checkpoint - try multiple paths
-    checkpoint_paths = [
-        'E:\\Adhera Server\\Models\\best_combined_model_lstm_binary\\best_combined_model_lstm.pt',
-        'E:\\Adhera Server\\Models\\best_combined_model_lstm.pt',
-        'E:\\Adhera Server\\Models\\best_combined_model_lstm_binary'
-    ]
-
-    checkpoint = None
-    for path in checkpoint_paths:
-        try:
-            checkpoint = torch.load(path, map_location=device, weights_only=False)
-            print(f"[OK] Loaded checkpoint from {path}")
-            break
-        except Exception as e:
-            continue
-
-    if checkpoint is None:
-        raise FileNotFoundError(f"Could not find facial model checkpoint in any of: {checkpoint_paths}")
-
-    facial_model.model_full.load_state_dict(checkpoint['model_full_state_dict'])
-    facial_model.model_face.load_state_dict(checkpoint['model_face_state_dict'])
-    facial_model.mlp_classifier.load_state_dict(checkpoint['mlp_classifier_state_dict'])
+    app_ready_path = BASE_DIR / "Models" / "best_combined_model_lstm_binary_app.pt"
+    facial_model = torch.jit.load(str(app_ready_path), map_location=device).to(device)
     facial_model.eval()
-    print("[OK] Facial Model loaded successfully.")
+    print("[OK] Facial TorchScript model loaded successfully.")
 except Exception as e:
-    print(f"[ERROR] Error loading Facial Model: {e}")
-    facial_model = None
+    print(f"[WARN] Could not load Facial TorchScript artifact: {e}")
+    try:
+        hidden_size = 512
+        feature_dim = 1280
+        num_layers = 1
+        dropout_rate = 0.5
+        num_classes = 2
+        combined_feature_size = hidden_size * 2
+
+        model_full = LSTMClassifier(feature_dim, hidden_size, num_layers, dropout_rate).to(device)
+        model_face = LSTMClassifier(feature_dim, hidden_size, num_layers, dropout_rate).to(device)
+        mlp_classifier = nn.Sequential(
+            nn.Linear(combined_feature_size, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, num_classes)
+        ).to(device)
+
+        facial_model = CombinedFacialModel(model_full, model_face, mlp_classifier).to(device)
+        checkpoint_path = BASE_DIR / "Models" / "best_combined_model_lstm_binary.pt"
+        checkpoint = torch.load(str(checkpoint_path), map_location=device, weights_only=False)
+
+        facial_model.model_full.load_state_dict(checkpoint['model_full_state_dict'])
+        facial_model.model_face.load_state_dict(checkpoint['model_face_state_dict'])
+        facial_model.mlp_classifier.load_state_dict(checkpoint['mlp_classifier_state_dict'])
+        facial_threshold = float(checkpoint.get("best_threshold", 0.5))
+        facial_model.eval()
+        print("[OK] Facial checkpoint model loaded successfully.")
+    except Exception as fallback_error:
+        print(f"[ERROR] Error loading Facial Model: {fallback_error}")
+        facial_model = None
+
+# 5. Eye Tracking Model & Assets
+print("\n=== Loading Eye Tracking Model ===")
+eye_tracking_interpreter = None
+eye_tracking_input_details = None
+eye_tracking_output_details = None
+eye_tracking_imputer = None
+eye_tracking_scaler = None
+eye_tracking_feature_order = None
+eye_tracking_scaler_order = None
+try:
+    eye_assets_dir = BASE_DIR / "Models" / "EyeTrackingAssets"
+    eye_tracking_interpreter = tf.lite.Interpreter(
+        model_path=str(eye_assets_dir / "focusTest_transformer.tflite")
+    )
+    eye_tracking_interpreter.allocate_tensors()
+    eye_tracking_input_details = eye_tracking_interpreter.get_input_details()
+    eye_tracking_output_details = eye_tracking_interpreter.get_output_details()
+
+    eye_tracking_imputer = joblib.load(eye_assets_dir / "feature_imputer.pkl")
+    if not hasattr(eye_tracking_imputer, "_fill_dtype"):
+        eye_tracking_imputer._fill_dtype = getattr(
+            eye_tracking_imputer, "_fit_dtype", np.dtype(np.float64)
+        )
+    eye_tracking_scaler = joblib.load(eye_assets_dir / "feature_scaler.pkl")
+    with open(eye_assets_dir / "feature_order.json", "r", encoding="utf-8") as f:
+        eye_tracking_feature_order = json.load(f)
+
+    eye_tracking_scaler_order = list(
+        getattr(eye_tracking_scaler, "feature_names_in_", eye_tracking_feature_order)
+    )
+    print("[OK] Eye Tracking Model & Assets loaded successfully.")
+except Exception as e:
+    print(f"[ERROR] Error loading Eye Tracking Model: {e}")
+    eye_tracking_interpreter = None
 
 # ===================== EEG Preprocessing Functions =====================
 
@@ -285,10 +316,66 @@ def process_mri_stream(image_bytes):
     full_features = np.hstack([roi_values, site_feature]).reshape(1, -1)
     return full_features
 
+
+def process_eye_tracking_features(features: Union[List[float], Dict[str, float]]):
+    """Prepare eye tracking engineered features for the TFLite transformer."""
+    if eye_tracking_feature_order is None or eye_tracking_scaler_order is None:
+        raise ValueError("Eye tracking feature metadata not loaded")
+
+    expected_count = len(eye_tracking_feature_order)
+    if isinstance(features, dict):
+        missing = [name for name in eye_tracking_feature_order if name not in features]
+        if missing:
+            raise ValueError(f"Missing eye tracking features: {missing}")
+        feature_map = {name: float(features[name]) for name in eye_tracking_feature_order}
+    else:
+        if len(features) != expected_count:
+            raise ValueError(
+                f"Expected {expected_count} eye tracking features in feature_order.json order, got {len(features)}"
+            )
+        feature_map = {
+            name: float(value)
+            for name, value in zip(eye_tracking_feature_order, features)
+        }
+
+    scaler_input = pd.DataFrame(
+        [[feature_map[name] for name in eye_tracking_scaler_order]],
+        columns=eye_tracking_scaler_order
+    )
+    imputed = eye_tracking_imputer.transform(scaler_input)
+    scaled = eye_tracking_scaler.transform(
+        pd.DataFrame(imputed, columns=eye_tracking_scaler_order)
+    )
+
+    scaled_by_name = dict(zip(eye_tracking_scaler_order, scaled[0]))
+    ordered_scaled = np.array(
+        [scaled_by_name[name] for name in eye_tracking_feature_order],
+        dtype=np.float32
+    )
+    return ordered_scaled.reshape(1, 8, 10)
+
+
+def run_facial_prediction(full_tensor, face_tensor):
+    """Run either the app-ready TorchScript model or the fallback checkpoint model."""
+    output = facial_model(full_tensor, face_tensor)
+    if isinstance(output, tuple):
+        logits, probs = output
+    else:
+        logits = output
+        probs = torch.softmax(logits, dim=1)
+    high_probability = probs[0, 1].item()
+    prediction = 1 if high_probability >= facial_threshold else 0
+    confidence = probs[0, prediction].item()
+    return prediction, high_probability, confidence
+
 # ===================== API Data Models =====================
 
 class QuestionnaireData(BaseModel):
     features: List[float]
+
+
+class EyeTrackingData(BaseModel):
+    features: Union[List[float], Dict[str, float]]
 
 # ===================== Endpoints =====================
 
@@ -302,7 +389,8 @@ async def root():
             "/predict/mri",
             "/predict/questionnaire",
             "/predict/eeg",
-            "/predict/facial"
+            "/predict/facial",
+            "/predict/eye-tracking"
         ]
     }
 
@@ -314,7 +402,8 @@ async def health():
         "mri_model": "loaded" if mri_model is not None else "not_loaded",
         "questionnaire_model": "loaded" if questionnaire_model is not None else "not_loaded",
         "eeg_model": "loaded" if eeg_model is not None else "not_loaded",
-        "facial_model": "loaded" if facial_model is not None else "not_loaded"
+        "facial_model": "loaded" if facial_model is not None else "not_loaded",
+        "eye_tracking_model": "loaded" if eye_tracking_interpreter is not None else "not_loaded"
     }
 
 
@@ -379,12 +468,12 @@ async def predict_eeg(file: UploadFile = File(...)):
         # Prediction
         predictions = eeg_model.predict(X, verbose=0)
 
-        # Convert numpy → safe python types
+        # Convert numpy â†’ safe python types
         predictions = np.array(predictions)
 
-        avg_prob = float(np.mean(predictions))   # 👈 مهم جدًا
-        prediction = int(avg_prob >= 0.5)        # 👈 ensure Python int
-        probability_percent = float(round(avg_prob * 100, 2))  # 👈 safe float
+        avg_prob = float(np.mean(predictions))   # ðŸ‘ˆ Ù…Ù‡Ù… Ø¬Ø¯Ù‹Ø§
+        prediction = int(avg_prob >= 0.5)        # ðŸ‘ˆ ensure Python int
+        probability_percent = float(round(avg_prob * 100, 2))  # ðŸ‘ˆ safe float
 
         return {
             "status": "success",
@@ -402,21 +491,43 @@ async def predict_eeg(file: UploadFile = File(...)):
 
 @app.post("/predict/facial")
 async def predict_facial(file: UploadFile = File(...)):
-    """Predict engagement level from facial expression video"""
+    """Predict binary engagement from facial expression video"""
+    video_path = None
     try:
         if facial_model is None:
             return {"status": "error", "message": "Facial model not loaded"}
 
         # Save video temporarily
-        video_path = f"/tmp/{file.filename}"
-        os.makedirs('/tmp', exist_ok=True)
-
         content = await file.read()
-        with open(video_path, 'wb') as f:
+        suffix = Path(file.filename or "").suffix or ".mp4"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
             f.write(content)
+            video_path = f.name
+
+        print(
+            f"[FACIAL] Uploaded file size: "
+            f"{os.path.getsize(video_path)/1024/1024:.2f} MB"
+        )
 
         # Extract features from video
-        full_features, face_features = extract_features_from_video(video_path, device)
+        try:
+            full_features, face_features = extract_features_from_video(
+                video_path,
+                device,
+                num_frames=20
+            )
+        except Exception as extraction_error:
+            return {
+                "status": "error",
+                "message": f"Feature extraction failed: {extraction_error}"
+            }
+
+        print(
+            f"[FACIAL] full_features shape={full_features.shape}"
+        )
+        print(
+            f"[FACIAL] face_features shape={face_features.shape}"
+        )
 
         # Convert to tensors
         full_tensor = torch.tensor(full_features, dtype=torch.float32).unsqueeze(0).to(device)
@@ -424,21 +535,48 @@ async def predict_facial(file: UploadFile = File(...)):
 
         # Predict
         with torch.no_grad():
-            logits = facial_model(full_tensor, face_tensor)
-            probs = torch.softmax(logits, dim=1)
-            pred_class = torch.argmax(probs, dim=1).item()
-            confidence = round(probs[0, pred_class].item() * 100, 2)
+            prediction, high_probability, confidence = run_facial_prediction(full_tensor, face_tensor)
 
-        # Clean up
-        os.remove(video_path)
-
-        engagement_levels = ["Very Low", "Low", "High", "Very High"]
+        engagement_labels = ["Low", "High"]
 
         return {
             "status": "success",
-            "engagement_level": pred_class,
-            "engagement_label": engagement_levels[pred_class],
-            "confidence": confidence
+            "prediction": prediction,
+            "engagement_label": engagement_labels[prediction],
+            "high_engagement_probability": round(high_probability * 100, 2),
+            "confidence": round(confidence * 100, 2),
+            "message": "Analyzed 20 video frames"
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}
+    finally:
+        if video_path and os.path.exists(video_path):
+            os.remove(video_path)
+
+
+@app.post("/predict/eye-tracking")
+async def predict_eye_tracking(data: EyeTrackingData):
+    """Predict ADHD from engineered eye tracking features"""
+    try:
+        if eye_tracking_interpreter is None:
+            return {"status": "error", "message": "Eye tracking model not loaded"}
+
+        model_input = process_eye_tracking_features(data.features)
+        input_index = eye_tracking_input_details[0]["index"]
+        output_index = eye_tracking_output_details[0]["index"]
+
+        eye_tracking_interpreter.set_tensor(input_index, model_input)
+        eye_tracking_interpreter.invoke()
+        output = eye_tracking_interpreter.get_tensor(output_index)
+        probability = float(np.array(output).reshape(-1)[0])
+        prediction = int(probability >= 0.5)
+
+        return {
+            "status": "success",
+            "prediction": prediction,
+            "probability": round(probability * 100, 2),
+            "message": "Analyzed 8 eye tracking blocks with 10 features each"
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
